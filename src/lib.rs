@@ -46,6 +46,7 @@ struct CoWecBlock<R, T> {
 impl<R: Default, T> CoWecBlock<R, T> {
     const LEN_MASK: u16 = 0b0000_1111_1111_1111;
     const CAP_OFFSET: u16 = 12;
+    const DATA_OFFSET: usize = Layout::new::<Self>().size();
 
     fn len(&self) -> usize {
         (self.len & Self::LEN_MASK) as usize
@@ -66,17 +67,25 @@ impl<R: Default, T> CoWecBlock<R, T> {
         head.extend(tail).expect("Invalid layout created").0
     }
 
+    unsafe fn get_data_mut(me: *mut Self) -> *mut MaybeUninit<T> {
+        me.cast::<u8>().add(Self::DATA_OFFSET).cast()
+    }
+
+    unsafe fn get_data(me: *const Self) -> *const MaybeUninit<T> {
+        me.cast::<u8>().add(Self::DATA_OFFSET).cast()
+    }
+
     /// A very much manual destructor. We can't really do proper Drop due to talking to the
     /// allocator.
     unsafe fn dispose(me: *mut Self) {
+        let data = Self::get_data_mut(me);
         let me_ref = me.as_mut().expect("Got invalid pointer to dispose");
         let layout = Self::layout(me_ref.capacity());
         ptr::drop_in_place(&mut me_ref.rcell);
         if mem::needs_drop::<T>() {
             let len = me_ref.len();
-            let base = me_ref.data.as_mut_ptr();
             for i in 0..len {
-                let elem: &mut MaybeUninit<_> = &mut *base.add(i);
+                let elem: &mut MaybeUninit<_> = &mut *data.add(i);
                 ptr::drop_in_place(elem.as_mut_ptr()); // Drop the thing *inside* the MaybeUninit
             }
         }
@@ -84,7 +93,7 @@ impl<R: Default, T> CoWecBlock<R, T> {
     }
 
     unsafe fn create(capacity: usize) -> *mut Self {
-        assert!(capacity.is_power_of_two());
+        debug_assert!(capacity.is_power_of_two());
         // TODO: Range check?
         let cap_encoded = capacity.trailing_zeros() as u16;
         let layout = Self::layout(capacity);
@@ -93,8 +102,8 @@ impl<R: Default, T> CoWecBlock<R, T> {
             len: cap_encoded << Self::CAP_OFFSET,
             data: [],
         };
-        assert_eq!(header.capacity(), capacity);
-        assert_eq!(header.len(), 0);
+        debug_assert_eq!(header.capacity(), capacity);
+        debug_assert_eq!(header.len(), 0);
         let me = alloc(layout).cast::<Self>();
         if me.is_null() {
             handle_alloc_error(layout);
@@ -105,7 +114,7 @@ impl<R: Default, T> CoWecBlock<R, T> {
     }
 
     unsafe fn resize(me: *mut Self, new_cap: usize) -> *mut Self {
-        assert!(new_cap.is_power_of_two());
+        debug_assert!(new_cap.is_power_of_two());
         // TODO: Cap range check
         let cap_encoded = new_cap.trailing_zeros() as u16;
         let me_ref = me.as_mut().expect("Got invalid pointer to resize");
@@ -119,17 +128,58 @@ impl<R: Default, T> CoWecBlock<R, T> {
 
         let me_ref = new_me.as_mut().unwrap();
         me_ref.len = (me_ref.len & Self::LEN_MASK) | (cap_encoded << Self::CAP_OFFSET);
-        assert_eq!(me_ref.capacity(), new_cap);
-        assert_eq!(me_ref.len(), old_len);
+        debug_assert_eq!(me_ref.capacity(), new_cap);
+        debug_assert_eq!(me_ref.len(), old_len);
         new_me
     }
 
-    
+    unsafe fn insert(me: *mut Self, pos: usize, val: T) {
+        let data = Self::get_data_mut(me);
+        let me_ref = &mut *me;
+        debug_assert!(me_ref.len() < me_ref.capacity(), "Over current capacity");
+        debug_assert!(pos <= me_ref.len(), "Position out of range");
+        let new_len = me_ref.len() as u16 + 1;
+        debug_assert_eq!(new_len & Self::LEN_MASK, new_len, "Can't encode new length {:b}", new_len);
+        let ptr_pos = data.add(pos);
+        ptr::copy(ptr_pos, ptr_pos.add(1), me_ref.len() - pos);
+        let elem = &mut *data.add(pos);
+        ptr::write(elem.as_mut_ptr(), val);
+        me_ref.len = (me_ref.len & !Self::LEN_MASK) | new_len;
+    }
+
+    unsafe fn remove(me: *mut Self, pos: usize) -> T {
+        let data = Self::get_data_mut(me);
+        let me_ref = &mut *me;
+        debug_assert!(pos < me_ref.len());
+        let ptr_pos = data.add(pos);
+        let elem = ptr::read(ptr_pos).assume_init();
+        ptr::copy(ptr_pos.add(1), ptr_pos, me_ref.len() - pos - 1);
+        me_ref.len -= 1; // len must be >0 by now, so no underflow and touching the capacity
+        elem
+    }
+
+    unsafe fn get<'a>(me: *const Self, pos: usize) -> &'a T {
+        let data = Self::get_data(me);
+        let me_ref = &*me;
+        debug_assert!(pos < me_ref.len());
+        let elem = data.add(pos);
+        &*(*elem).as_ptr()
+    }
+
+    unsafe fn get_mut<'a>(me: *mut Self, pos: usize) -> &'a mut T {
+        let data = Self::get_data_mut(me);
+        let me_ref = &*me;
+        debug_assert!(pos < me_ref.len());
+        let elem = data.add(pos);
+        &mut *(*elem).as_mut_ptr()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type B = CoWecBlock::<RCell, String>;
 
     /// Test some allocation routines (create/resize/dispose).
     ///
@@ -137,7 +187,6 @@ mod tests {
     /// there.
     #[test]
     fn allocation() {
-        type B = CoWecBlock::<RCell, String>;
         unsafe {
             let mut me = B::create(4);
             let mut me_ref = &*me;
@@ -147,6 +196,73 @@ mod tests {
             me_ref = &*me;
             assert_eq!(me_ref.len(), 0);
             assert_eq!(me_ref.capacity(), 8);
+            B::dispose(me);
+        }
+    }
+
+    #[test]
+    fn insert_end() {
+        unsafe {
+            let me = B::create(4);
+            B::insert(me, 0, "Hello".to_owned());
+            let me_ref = &mut *me;
+            assert_eq!(me_ref.len(), 1);
+            assert_eq!(me_ref.capacity(), 4);
+            assert_eq!(B::get(me, 0), "Hello");
+            B::insert(me, 1, "World".to_owned());
+            let me_ref = &mut *me;
+            assert_eq!(me_ref.len(), 2);
+            assert_eq!(me_ref.capacity(), 4);
+            assert_eq!(B::get(me, 0), "Hello");
+            assert_eq!(B::get(me, 1), "World");
+            B::dispose(me);
+        }
+    }
+
+    #[test]
+    fn insert_beginning() {
+        unsafe {
+            let me = B::create(4);
+            B::insert(me, 0, "Hello".to_owned());
+            let me_ref = &mut *me;
+            assert_eq!(me_ref.len(), 1);
+            assert_eq!(me_ref.capacity(), 4);
+            assert_eq!(B::get(me, 0), "Hello");
+            B::insert(me, 0, "World".to_owned());
+            let me_ref = &mut *me;
+            assert_eq!(me_ref.len(), 2);
+            assert_eq!(me_ref.capacity(), 4);
+            assert_eq!(B::get(me, 0), "World");
+            assert_eq!(B::get(me, 1), "Hello");
+            B::dispose(me);
+        }
+    }
+
+    #[test]
+    fn replace() {
+        unsafe {
+            let me = B::create(4);
+            B::insert(me, 0, "Hello".to_owned());
+            *B::get_mut(me, 0) = "World".to_owned();
+            let me_ref = &mut *me;
+            assert_eq!(me_ref.len(), 1);
+            assert_eq!(me_ref.capacity(), 4);
+            assert_eq!(B::get(me, 0), "World");
+            B::dispose(me);
+        }
+    }
+
+    #[test]
+    fn remove() {
+        unsafe {
+            let me = B::create(4);
+            B::insert(me, 0, "Hello".to_owned());
+            B::insert(me, 1, "World".to_owned());
+            assert_eq!(B::remove(me, 0), "Hello");
+            assert_eq!(B::remove(me, 0), "World");
+            let me_ref = &mut *me;
+            assert_eq!(me_ref.len(), 0);
+            assert_eq!(me_ref.capacity(), 4);
             B::dispose(me);
         }
     }
