@@ -1,15 +1,48 @@
 use std::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
 
-trait RefCnt {
-    
+pub unsafe trait RefCnt: Default {
+    /// Decrement the reference count.
+    ///
+    /// Returns true if the count drops to zero and it should be deallocated.
+    fn dec_ref(&self) -> bool;
+
+    /// Try incrementing the reference count.
+    ///
+    /// If it is too high, false is returned and the state is left unchanged.
+    fn inc_ref(&self) -> bool;
 }
 
-#[derive(Default)]
 #[repr(transparent)]
 struct RCell(Cell<u16>);
+
+impl Default for RCell {
+    fn default() -> Self {
+        // Note: we start with a single reference, not 0
+        Self(Cell::new(1))
+    }
+}
+
+unsafe impl RefCnt for RCell {
+    fn dec_ref(&self) -> bool {
+        let old = self.0.get();
+        self.0.set(old - 1);
+        old == 1
+    }
+
+    fn inc_ref(&self) -> bool {
+        let old = self.0.get();
+        if old == u16::MAX {
+            false
+        } else {
+            self.0.set(old + 1);
+            true
+        }
+    }
+}
 
 /// The header of block of CoWec.
 ///
@@ -43,7 +76,7 @@ struct CoWecBlock<R, T> {
     data: [MaybeUninit<T>; 0],
 }
 
-impl<R: Default, T> CoWecBlock<R, T> {
+impl<R: RefCnt, T> CoWecBlock<R, T> {
     const LEN_MASK: u16 = 0b0000_1111_1111_1111;
     const CAP_OFFSET: u16 = 12;
     const DATA_OFFSET: usize = Layout::new::<Self>().size();
@@ -64,7 +97,12 @@ impl<R: Default, T> CoWecBlock<R, T> {
     fn layout(capacity: usize) -> Layout {
         let head = Layout::new::<Self>();
         let tail = Layout::array::<MaybeUninit<T>>(capacity).expect("Invalid array layout");
-        head.extend(tail).expect("Invalid layout created").0
+        let layout = head.extend(tail).expect("Invalid layout created");
+        // That should not happen as the data array has size 0 and must be correctly aligned
+        // already, so there's no reason why further elements should need any padding for
+        // alignment.
+        assert_eq!(layout.1, Self::DATA_OFFSET, "Offset mismatch");
+        layout.0
     }
 
     unsafe fn get_data_mut(me: *mut Self) -> *mut MaybeUninit<T> {
@@ -90,6 +128,22 @@ impl<R: Default, T> CoWecBlock<R, T> {
             }
         }
         dealloc(me.cast(), layout);
+    }
+
+    unsafe fn dec_ref(me: *mut Self) {
+        let me_ref = me.as_mut().expect("Got invalid pointer to dec_ref");
+        if me_ref.rcell.dec_ref() {
+            Self::dispose(me);
+        }
+    }
+
+    unsafe fn inc_ref(me: *const Self) -> *const Self {
+        let me_ref = me.as_ref().expect("Got invalid pointer to inc_ref");
+        if me_ref.rcell.inc_ref() {
+            me
+        } else {
+            unimplemented!("Make an internal copy")
+        }
     }
 
     unsafe fn create(capacity: usize) -> *mut Self {
@@ -172,6 +226,94 @@ impl<R: Default, T> CoWecBlock<R, T> {
         debug_assert!(pos < me_ref.len());
         let elem = data.add(pos);
         &mut *(*elem).as_mut_ptr()
+    }
+}
+
+#[repr(transparent)]
+pub struct CoWec<R, T, U>
+where
+    R: RefCnt,
+{
+    ptr: usize,
+    _l: PhantomData<*mut CoWecBlock<R, T>>,
+    _r: PhantomData<*mut CoWecBlock<R, U>>,
+}
+
+impl<R, T, U> CoWec<R, T, U>
+where
+    R: RefCnt,
+{
+    pub fn new_stub() -> Self {
+        Self {
+            ptr: 0,
+            _l: PhantomData,
+            _r: PhantomData,
+        }
+    }
+
+    pub fn new_left() -> Self {
+        let l = unsafe { CoWecBlock::<R, T>::create(2) };
+        Self {
+            ptr: l as usize,
+            _l: PhantomData,
+            _r: PhantomData,
+        }
+    }
+
+    pub fn new_right() -> Self {
+        let r = unsafe { CoWecBlock::<R, U>::create(2) };
+        Self {
+            ptr: r as usize + 1,
+            _l: PhantomData,
+            _r: PhantomData,
+        }
+    }
+
+    pub fn is_stub(&self) -> bool {
+        self.ptr == 0
+    }
+
+    pub fn is_left(&self) -> bool {
+        self.ptr % 2 == 0 && !self.is_stub()
+    }
+
+    pub fn is_right(&self) -> bool {
+        !self.is_left() && !self.is_stub()
+    }
+}
+
+impl<R, T, U> Clone for CoWec<R, T, U>
+where
+    R: RefCnt,
+{
+    // FIXME: But we may want to provide shrinking and it would be great if we could do it when
+    // getting shared.
+    fn clone(&self) -> Self {
+        let ptr = if self.is_left() {
+            unsafe { CoWecBlock::<R, T>::inc_ref(self.ptr as *mut _) as usize }
+        } else if self.is_right() {
+            unsafe { CoWecBlock::<R, U>::inc_ref((self.ptr - 1) as *mut _) as usize + 1 }
+        } else {
+            0
+        };
+        Self {
+            ptr,
+            _l: PhantomData,
+            _r: PhantomData,
+        }
+    }
+}
+
+impl<R, T, U> Drop for CoWec<R, T, U>
+where
+    R: RefCnt,
+{
+    fn drop(&mut self) {
+        if self.is_left() {
+            unsafe { CoWecBlock::<R, T>::dec_ref(self.ptr as *mut _) }
+        } else if self.is_right() {
+            unsafe { CoWecBlock::<R, U>::dec_ref((self.ptr - 1) as *mut _) }
+        }
     }
 }
 
@@ -265,5 +407,46 @@ mod tests {
             assert_eq!(me_ref.capacity(), 4);
             B::dispose(me);
         }
+    }
+
+    type CW = CoWec::<RCell, String, usize>;
+
+    /// Check construction & destruction of the empty thing
+    #[test]
+    fn create_empty() {
+        let c = CW::new_stub();
+        assert!(c.is_stub());
+        assert!(!c.is_left());
+        assert!(!c.is_right());
+    }
+
+    #[test]
+    fn create_left() {
+        let c = CW::new_left();
+        assert!(!c.is_stub());
+        assert!(c.is_left());
+        assert!(!c.is_right());
+    }
+
+    #[test]
+    fn create_right() {
+        let c = CW::new_right();
+        assert!(!c.is_stub());
+        assert!(!c.is_left());
+        assert!(c.is_right());
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn clone_stub() {
+        let c = CW::new_stub();
+        let _d = c.clone();
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn clone_left_empty() {
+        let c = CW::new_left();
+        let _d = c.clone();
     }
 }
